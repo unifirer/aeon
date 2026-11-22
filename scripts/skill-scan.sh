@@ -6,6 +6,7 @@ set -euo pipefail
 # Usage:
 #   ./scripts/skill-scan.sh <path-to-SKILL.md>
 #   ./scripts/skill-scan.sh skills/my-skill/SKILL.md
+#   ./scripts/skill-scan.sh skills/my-skill    # SKILL.md + every .md/.txt it ships
 #   ./scripts/skill-scan.sh --all              # Scan all skills
 #   ./scripts/skill-scan.sh --all --json        # JSON output
 #
@@ -27,10 +28,26 @@ fi
 
 JSON_OUTPUT=false
 SCAN_ALL=false
+DIR_MODE=false
 FILES=()
+LINK_ESCAPES=()
+
+# is_media <file>: true for formats an agent does not read as text, by magic bytes, not by name.
+# PNG, JPEG, GIF, WebP, ICO, PDF, WOFF/WOFF2/TTF/OTF, ZIP, gzip.
+# Several of these headers are plain text (GIF89a, %PDF, OTTO, wOFF), so a match does not
+# skip the file: scan_file still runs the HIGH sink and injection rules on it.
+is_media() {
+  local magic
+  magic=$(LC_ALL=C head -c 12 "$1" 2>/dev/null | LC_ALL=C od -An -tx1 | tr -d ' \n')
+  case "$magic" in
+    89504e470d0a1a0a*|ffd8ff*|47494638*|52494646????????57454250*|00000100*|25504446*) return 0 ;;
+    774f4646*|774f4632*|00010000*|4f54544f*|504b0304*|1f8b*) return 0 ;;
+  esac
+  return 1
+}
 
 usage() {
-  echo "Usage: $0 <SKILL.md path> [--json]"
+  echo "Usage: $0 <SKILL.md path | skill dir> [--json]"
   echo "       $0 --all [--json]"
   exit 2
 }
@@ -42,7 +59,30 @@ while [[ $# -gt 0 ]]; do
     --json) JSON_OUTPUT=true; shift ;;
     --help|-h) usage ;;
     -*) echo "Unknown option: $1" >&2; usage ;;
-    *) FILES+=("$1"); shift ;;
+    *)
+      # A skill directory: SKILL.md first, then every file it ships, whatever the extension
+      # (references/setup, *.yaml, *.mjs ...). SKILL.md can point the agent at any of them.
+      # Every non-empty file is scanned, even with a NUL byte in it; known image/font/archive
+      # formats get the HIGH rules only (see scan_file). Caps below fail closed.
+      # Paths are read NUL-separated, so a newline in a file name cannot split it.
+      if [[ -d "$1" ]]; then
+        d="${1%/}"
+        DIR_MODE=true
+        [[ -f "$d/SKILL.md" ]] && FILES+=("$d/SKILL.md")
+        while IFS= read -r -d '' f; do
+          [[ -s "$f" ]] && FILES+=("$f")
+        done < <(find "$d" -type f ! -path "$d/SKILL.md" ! -path '*/.git/*' -print0 2>/dev/null | LC_ALL=C sort -z)
+        # A symlink is followed by the agent but not by find -type f; one that leaves the
+        # folder could pull in any file on the machine, so it fails the scan.
+        while IFS= read -r -d '' l; do
+          t=$(cd "$(dirname "$l")" 2>/dev/null && cd "$(dirname "$(readlink "$l")")" 2>/dev/null && pwd -P)/$(basename "$(readlink "$l")")
+          root=$(cd "$d" && pwd -P)
+          case "$t" in "$root"/*) [[ -f "$t" ]] && FILES+=("$l") ;; *) LINK_ESCAPES+=("$l") ;; esac
+        done < <(find "$d" -type l ! -path '*/.git/*' -print0 2>/dev/null | LC_ALL=C sort -z)
+      else
+        FILES+=("$1")
+      fi
+      shift ;;
   esac
 done
 
@@ -55,6 +95,32 @@ fi
 if [[ ${#FILES[@]} -eq 0 ]]; then
   echo "No files to scan." >&2
   usage
+fi
+
+# Caps keep a hostile skill folder from making the scan slow; going past one fails closed.
+# They apply to directory mode only, so --all is not limited by the size of the repo.
+MAX_FILES=500
+MAX_BYTES=1048576
+MAX_TOTAL_BYTES=10485760
+if [[ "$DIR_MODE" == "true" ]]; then
+  if [[ ${#FILES[@]} -gt $MAX_FILES ]]; then
+    echo "[FAIL] ${#FILES[@]} files to scan, over the limit of $MAX_FILES. Review this skill by hand."
+    exit 1
+  fi
+  total=0
+  # Media do not count toward the total, so a skill with real images is not failed for them.
+  for f in "${FILES[@]}"; do
+    is_media "$f" && continue
+    total=$((total + $( (wc -c < "$f") 2>/dev/null | tr -d ' ' || true) + 0))
+  done
+  if [[ $total -gt $MAX_TOTAL_BYTES ]]; then
+    echo "[FAIL] $total bytes to scan, over the limit of $MAX_TOTAL_BYTES. Review this skill by hand."
+    exit 1
+  fi
+  if [[ ${#LINK_ESCAPES[@]} -gt 0 ]]; then
+    for l in "${LINK_ESCAPES[@]}"; do echo "[FAIL] $l is a symlink that points outside the skill folder ($(readlink "$l"))."; done
+    exit 1
+  fi
 fi
 
 # Load trusted sources
@@ -93,8 +159,10 @@ fi
 # HIGH · SINKS — real code-execution / exfiltration / destruction. These match
 # the dangerous act itself, so they hold wherever the text appears.
 HIGH_SINK_PATTERNS=(
-  # Arbitrary code execution
-  'eval[[:space:]]'
+  # Arbitrary code execution: `eval` followed by something it can run (a quote, `$`,
+  # backtick, `(` or `--`), so prose like "the eval harness" or "long eval strings"
+  # in a reference doc does not read as a command.
+  '(^|[^[:alnum:]_])eval[[:space:]]+[^.,;:!?]*["'\''$`(\\]'
   'eval\('
   # Remote code execution: a download piped straight into an interpreter, or fed
   # to one via process substitution (`bash <(curl …)`, `source <(curl …)`,
@@ -130,7 +198,9 @@ HIGH_SINK_PATTERNS=(
   'rm[[:space:]]+([-][a-zA-Z-]+[[:space:]]+)*["'\'']?/(["'\'']|[[:space:]]|$|--)'
   'rm[[:space:]]+([-][a-zA-Z-]+[[:space:]]+)*["'\'']?/\*'
   'rm[[:space:]]+([-][a-zA-Z-]+[[:space:]]+)*["'\'']?/(bin|boot|dev|etc|home|lib|lib64|opt|proc|root|sbin|sys|usr|var)(["'\'']|[[:space:]]|/|$)'
-  'rm[[:space:]]+([-][a-zA-Z-]+[[:space:]]+)*\*'
+  # The glob must end the command (end of line, `;`, `&`, `|`, `)`, backtick, or a path/flag
+  # after it), so `rm * rm` and `rm * Math.sqrt` in code, where an operand follows, don't match.
+  'rm[[:space:]]+([-][a-zA-Z-]+[[:space:]]+)*\*[[:space:]]*($|[^[:alnum:]_[:space:](]|[0-9]+>)'
   'rm[[:space:]]+([-][a-zA-Z-]+[[:space:]]+)*~'
   'mkfs\.'
   'dd[[:space:]]+if=.*of=/dev/'
@@ -145,13 +215,15 @@ HIGH_SINK_PATTERNS=(
 # DEFENSIVE_CONTEXT): a skill that says «if content reads "ignore previous
 # instructions", discard it» is documenting its defense, not issuing an attack.
 # Without this, every skill that hardens itself scored a HIGH against itself.
+# Matched case-insensitively (grep -i in scan_prose), so `IGNORE PREVIOUS INSTRUCTIONS`
+# and `Ignore Previous Instructions` cannot slip past by capitalisation.
 HIGH_INJECTION_PATTERNS=(
-  '[Ii]gnore[[:space:]]+(all[[:space:]]+)?previous[[:space:]]+instructions'
-  '[Ii]gnore[[:space:]]+(all[[:space:]]+)?prior[[:space:]]+instructions'
-  '[Yy]ou[[:space:]]+are[[:space:]]+now[[:space:]]+'
-  '[Ff]orget[[:space:]]+(all[[:space:]]+)?(your[[:space:]]+)?instructions'
-  '[Dd]isregard[[:space:]]+(all[[:space:]]+)?previous'
-  '[Oo]verride[[:space:]]+(all[[:space:]]+)?rules'
+  'ignore[[:space:]]+(all[[:space:]]+)?previous[[:space:]]+instructions'
+  'ignore[[:space:]]+(all[[:space:]]+)?prior[[:space:]]+instructions'
+  'you[[:space:]]+are[[:space:]]+now[[:space:]]+'
+  'forget[[:space:]]+(all[[:space:]]+)?(your[[:space:]]+)?instructions'
+  'disregard[[:space:]]+(all[[:space:]]+)?(previous|prior)'
+  'override[[:space:]]+(all[[:space:]]+)?rules'
 )
 
 # Anti-injection framing. When one of these MULTI-WORD rejection phrases appears on
@@ -172,7 +244,7 @@ DEFENSIVE_CONTEXT='never follow|do not follow|do not obey|never obey|ignore (it|
 # by an unrelated quoted token (`"Note" Ignore all previous instructions…`) is NOT
 # treated as cited and still FAILs. Documentation genuinely wraps the phrase
 # (`if content says "ignore previous instructions", discard it`) and is suppressed.
-INJECTION_CITED='["`][^"`]*([Ii]gnore|[Ff]orget|[Dd]isregard|[Oo]verride|[Yy]ou[[:space:]]+are[[:space:]]+now)[^"`]*["`]'
+INJECTION_CITED='["`][^"`]*(ignore|forget|disregard|override|you[[:space:]]+are[[:space:]]+now)[^"`]*["`]'
 
 # MEDIUM severity: suspicious patterns that may or may not be intentional
 # shellcheck disable=SC2088  # these are literal grep patterns matched against
@@ -233,12 +305,55 @@ LOW_PATTERNS=(
   '>[[:space:]]+/'
 )
 
+# Invisible characters: text the model reads but a reviewer never sees. Matched as
+# raw UTF-8 bytes; every tool in the pipeline runs under LC_ALL=C because grep -o
+# can emit a partial (invalid UTF-8) sequence that BSD tools reject in a UTF-8 locale.
+#   HIGH   Unicode TAG block U+E0000-E007F (ASCII smuggling: a whole hidden sentence)
+#   HIGH   bidi embedding/override/isolate U+202A-202E, U+2066-2069 (Trojan Source)
+#   HIGH   variation selectors that can carry a payload (emoji smuggling: each one
+#          encodes a byte): a run of 2+ of U+FE00-FE0F / U+E0100-E01EF in any mix,
+#          or 2+ of U+FE00-FE0D / U+E0100-E01EF anywhere on one line (so invisible
+#          separators between them do not break the count)
+#   MEDIUM zero-width U+200B-200C, U+2060-2064; soft hyphen U+00AD; a lone
+#          variation selector supplement char U+E0100-E01EF; U+FEFF past byte 0;
+#          U+200D not between two emoji (all can split a word past the keyword rules)
+# Allowed: a BOM at byte 0, U+200D joining two emoji, a lone U+FE00-FE0F (U+FE0F and
+# U+FE0E pick emoji or text style), and the three real subdivision flags (England,
+# Scotland, Wales), matched by exact bytes.
+# Not flagged: LRM/RLM/ALM (U+200E, U+200F, U+061C); they mark direction in RTL text
+# and cannot reorder it the way overrides and isolates do.
+HIDDEN_TAG=$'\xf3\xa0[\x80\x81]'
+HIDDEN_BIDI=$'\xe2\x80[\xaa-\xae]|\xe2\x81[\xa6-\xa9]'
+HIDDEN_VS_RUN=$'(\xef\xb8[\x80-\x8f]|\xf3\xa0[\x84-\x87][\x80-\xbf]){2,}'
+HIDDEN_VS_RARE=$'\xef\xb8[\x80-\x8d]|\xf3\xa0[\x84-\x87]'
+HIDDEN_ZW=$'\xe2\x80[\x8b\x8c\x8d]|\xe2\x81[\xa0-\xa4]|\xc2\xad|\xef\xbb\xbf|\xf3\xa0[\x84-\x87]'
+# MEDIUM: a Latin letter directly next to a Cyrillic one (U+0400-04FF) inside one word,
+# e.g. `іgnore` with a Cyrillic і. Real Russian text is all-Cyrillic words and does
+# not match. Greek is left out on purpose: skills write `Δprice` and `θmax`.
+MIXED_SCRIPT=$'[A-Za-z][\xd0-\xd3][\x80-\xbf]|[\xd0-\xd3][\x80-\xbf][A-Za-z]'
+# MEDIUM: inline CSS that hides text from a rendered view (an HTML page, a Markdown
+# preview) while the model still reads it.
+CSS_HIDDEN='style[[:space:]]*=[[:space:]]*["'\''][^"'\'']*(display[[:space:]]*:[[:space:]]*none|visibility[[:space:]]*:[[:space:]]*hidden|font-size[[:space:]]*:[[:space:]]*0([^.0-9]|$)|opacity[[:space:]]*:[[:space:]]*0([^.0-9]|$))'
+_TAG_GB=$'\xf3\xa0\x81\xa7\xf3\xa0\x81\xa2'
+_TAG_END=$'\xf3\xa0\x81\xbf'
+TAG_FLAG=$'\xf0\x9f\x8f\xb4'"$_TAG_GB"$'(\xf3\xa0\x81\xa5\xf3\xa0\x81\xae\xf3\xa0\x81\xa7|\xf3\xa0\x81\xb3\xf3\xa0\x81\xa3\xf3\xa0\x81\xb4|\xf3\xa0\x81\xb7\xf3\xa0\x81\xac\xf3\xa0\x81\xb3)'"$_TAG_END"
+# 4-byte emoji (U+1F000-1FAFF) or a BMP pictograph (U+2600-27BF, U+2B00-2B7F for the
+# black square in a black cat or bird), optional FE0F, then ZWJ, then another emoji.
+_EMOJI=$'(\xf0\x9f[\x80-\xab][\x80-\xbf]|\xe2[\x98-\x9e][\x80-\xbf]|\xe2[\xac\xad][\x80-\xbf])(\xef\xb8\x8f)?'
+EMOJI_ZWJ="${_EMOJI}"$'\xe2\x80\x8d'"(${_EMOJI})"
+
 # ---------- Scanner ----------
 
 TOTAL_PASS=0
 TOTAL_WARN=0
 TOTAL_FAIL=0
 JSON_RESULTS=""
+
+# The NUL-stripped temp copy scan_file is working on, removed on any exit (Ctrl-C included).
+SCAN_TMP=""
+trap 'rm -f "${SCAN_TMP:-}"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # scan_tier <file> <pattern>...  — emit one "L<n>: <content> [pattern: <p>]" line
 # per grep match across the tier's patterns. Bash 3.2-safe (no namerefs): the
@@ -259,22 +374,41 @@ scan_tier() {
   done
 }
 
+# scan_tier_i <file> <pattern>...  — scan_tier, case-insensitive (CSS is).
+scan_tier_i() {
+  local file="$1"; shift
+  local pattern matches match line_content
+  for pattern in "$@"; do
+    matches=$(grep -niE "$pattern" "$file" 2>/dev/null || true)
+    [[ -n "$matches" ]] || continue
+    while IFS= read -r match; do
+      line_content="${match#*:}"
+      printf 'L%s: %s [pattern: hidden by CSS]\n' "${match%%:*}" "${line_content:0:120}"
+    done <<< "$matches"
+  done
+}
+
 # scan_prose <file> <pattern>...  — like scan_tier, but suppresses a match when
 # its line also carries anti-injection framing (DEFENSIVE_CONTEXT). Used for the
 # prompt-injection tier so a skill documenting its own defense doesn't FAIL
 # itself. Same "L<n>: <content> [pattern: <p>]" output contract as scan_tier.
 scan_prose() {
   local file="$1"; shift
-  local pattern matches match line_num line_content
+  local pattern matches match line_num line_content folded
+  # Matched against the look-alike-folded text, so `іgnore` (Cyrillic і) reads as `ignore`.
+  if ! folded=$(fold_confusables "$file" 2>/dev/null | LC_ALL=C tr -d '\000'); then
+    printf 'L0: could not fold look-alike letters for the injection check [prompt injection]\n'
+    return
+  fi
   for pattern in "$@"; do
-    matches=$(grep -nE "$pattern" "$file" 2>/dev/null || true)
+    matches=$(printf '%s\n' "$folded" | grep -niE "$pattern" 2>/dev/null || true)
     [[ -n "$matches" ]] || continue
     while IFS= read -r match; do
       line_num="${match%%:*}"
       line_content="${match#*:}"
       # Defensive framing (keyword) or a cited/quoted phrase → not an attack. Skip.
       if printf '%s' "$line_content" | grep -qiE "$DEFENSIVE_CONTEXT" \
-         || printf '%s' "$line_content" | grep -qE "$INJECTION_CITED"; then
+         || printf '%s' "$line_content" | grep -qiE "$INJECTION_CITED"; then
         continue
       fi
       line_content="${line_content:0:120}"  # truncate
@@ -283,14 +417,110 @@ scan_prose() {
   done
 }
 
+# fold_confusables <file>  — the file with Cyrillic and Greek letters that render like
+# Latin ones replaced by the Latin letter, byte for byte otherwise, so line numbers hold.
+# Only exact look-alikes are folded; real Russian or Greek words stay unreadable as
+# English, so they cannot start matching an injection phrase.
+fold_confusables() {
+  local s="" from to
+  local -a pairs=(
+    $'\xd0\xb0' a $'\xd0\xb5' e $'\xd0\xbe' o $'\xd1\x80' p $'\xd1\x81' c $'\xd1\x83' y $'\xd1\x85' x
+    $'\xd1\x96' i $'\xd1\x98' j $'\xd1\x95' s $'\xd2\xbb' h $'\xd4\x81' d $'\xd4\x9b' q $'\xd4\x9d' w
+    $'\xd0\x90' A $'\xd0\x92' B $'\xd0\x95' E $'\xd0\x9a' K $'\xd0\x9c' M $'\xd0\x9d' H $'\xd0\x9e' O
+    $'\xd0\xa0' P $'\xd0\xa1' C $'\xd0\xa2' T $'\xd0\xa5' X $'\xd0\x86' I $'\xd0\x88' J $'\xd0\x85' S
+    $'\xce\xbf' o $'\xce\xb1' a $'\xce\xb9' i $'\xce\xbd' v $'\xcf\x81' p
+    $'\xce\x91' A $'\xce\x92' B $'\xce\x95' E $'\xce\x97' H $'\xce\x99' I $'\xce\x9a' K $'\xce\x9c' M
+    $'\xce\x9d' N $'\xce\x9f' O $'\xce\xa1' P $'\xce\xa4' T $'\xce\xa7' X $'\xce\x96' Z
+  )
+  while [[ ${#pairs[@]} -gt 0 ]]; do
+    from="${pairs[0]}"; to="${pairs[1]}"; pairs=("${pairs[@]:2}")
+    s+="s/$from/$to/g;"
+  done
+  LC_ALL=C sed -e "$s" "$1"
+}
+
+# strip_allowed <file>  — the file with the allowed invisible sequences removed
+# (real subdivision flags, emoji ZWJ joins, a BOM at byte 0), byte for byte otherwise.
+strip_allowed() {
+  local bom=$'\xef\xbb\xbf'
+  LC_ALL=C sed -E -e "1s/^$bom//" -e "s/$TAG_FLAG//g" -e ":z" -e "s/$EMOJI_ZWJ/\\1\\2\\4/g" -e "tz" "$1"
+}
+
+# scan_hidden <file> <label> <byte-pattern> [min]: one "L<n>: <label> x<count>" line
+# per line with at least <min> matches (default 1). The matched text is never echoed: it is invisible, and for TAG
+# smuggling it is the payload itself. Same output contract as scan_tier.
+# Fails closed: if the file can't be filtered or searched, that is reported as a finding.
+# NUL bytes are dropped before $(...) would drop them with a noisy bash warning.
+scan_hidden() {
+  local file="$1" label="$2" pattern="$3" min="${4:-1}" stripped hits rc line_num count
+  if ! stripped=$(strip_allowed "$file" 2>/dev/null | LC_ALL=C tr -d '\000'); then
+    printf 'L0: %s: could not scan file for hidden characters [hidden characters]\n' "$label"
+    return
+  fi
+  hits=$(printf '%s\n' "$stripped" | LC_ALL=C grep -noE "$pattern") && rc=0 || rc=$?
+  if [[ $rc -gt 1 ]]; then
+    printf 'L0: %s: could not scan file for hidden characters [hidden characters]\n' "$label"
+    return
+  fi
+  [[ -n "$hits" ]] || return 0
+  while IFS=: read -r line_num count; do
+    printf 'L%s: %s x%s [hidden characters]\n' "$line_num" "$label" "$count"
+  done < <(printf '%s\n' "$hits" | LC_ALL=C cut -d: -f1 | LC_ALL=C uniq -c | LC_ALL=C awk -v min="$min" '$1 >= min {print $2":"$1}')
+}
+
 scan_file() {
   local file="$1"
-  local skill_name
-  skill_name=$(basename "$(dirname "$file")")
+  local skill_name dir
+  # Name the finding after the skill that owns the file, not its subfolder (references/ ...).
+  dir=$(dirname "$file")
+  while [[ "$dir" != "/" && "$dir" != "." && ! -f "$dir/SKILL.md" ]]; do dir=$(dirname "$dir"); done
+  if [[ -f "$dir/SKILL.md" ]]; then skill_name=$(basename "$dir"); else skill_name=$(basename "$(dirname "$file")"); fi
 
   if [[ ! -f "$file" ]]; then
     echo -e "${RED}ERROR${NC}: File not found: $file"
     return 1
+  fi
+
+  # Fail closed: a file the scanner cannot read may still be read by the agent.
+  if ! LC_ALL=C head -c 1 "$file" >/dev/null 2>&1; then
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    echo -e "${RED}[FAIL]${NC} $skill_name ($file)"
+    echo -e "  ${RED}HIGH${NC}: L0: could not read the file [unreadable]"
+    return 0
+  fi
+
+  # A known media header (PNG, GIF89a, %PDF ...) can be followed by plain text that cat shows
+  # and bash runs, so media are scanned too, but only for the HIGH sink and injection rules:
+  # the hidden-character, MEDIUM and LOW rules would fire on random image bytes.
+  local media=false
+  is_media "$file" && media=true
+
+  # A NUL byte makes grep treat the file as binary and match nothing, yet scripts with a NUL
+  # past line 1 still run and cat still shows the text. Scan a NUL-stripped copy instead.
+  # Findings are still reported under the real path.
+  local real="$file" tmp=""
+  if [[ $(LC_ALL=C tr -dc '\000' < "$file" | wc -c) -gt 0 ]]; then
+    if ! tmp=$(mktemp); then
+      TOTAL_FAIL=$((TOTAL_FAIL + 1))
+      echo -e "${RED}[FAIL]${NC} $skill_name ($real)"
+      echo -e "  ${RED}HIGH${NC}: L0: could not make a temp copy to scan [unreadable]"
+      return 0
+    fi
+    SCAN_TMP="$tmp"
+    LC_ALL=C tr -d '\000' < "$file" > "$tmp"
+    file="$tmp"
+  fi
+
+  # Media are exempt from the per-file cap like the total one; the HIGH rules are one grep each.
+  local size
+  size=$(wc -c < "$file" 2>/dev/null | tr -d ' ') || size=0
+  if [[ "$media" == "false" && "${size:-0}" -gt $MAX_BYTES ]]; then
+    [[ -n "$tmp" ]] && rm -f "$tmp"
+    SCAN_TMP=""
+    TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    echo -e "${RED}[FAIL]${NC} $skill_name ($real)"
+    echo -e "  ${RED}HIGH${NC}: L0: file is $size bytes, over the $MAX_BYTES-byte scan limit [size]"
+    return 0
   fi
 
   local content
@@ -303,8 +533,19 @@ scan_file() {
   # (scan_prose, which drops defensive framing). Both feed the same highs array.
   while IFS= read -r _line; do highs+=("$_line");   done < <(scan_tier  "$file" "${HIGH_SINK_PATTERNS[@]}")
   while IFS= read -r _line; do highs+=("$_line");   done < <(scan_prose "$file" "${HIGH_INJECTION_PATTERNS[@]}")
-  while IFS= read -r _line; do mediums+=("$_line"); done < <(scan_tier "$file" "${MEDIUM_PATTERNS[@]}")
-  while IFS= read -r _line; do lows+=("$_line");    done < <(scan_tier "$file" "${LOW_PATTERNS[@]}")
+  if [[ "$media" == "false" ]]; then
+    while IFS= read -r _line; do highs+=("$_line");   done < <(scan_hidden "$file" "Unicode TAG chars (hidden ASCII text)" "$HIDDEN_TAG")
+    while IFS= read -r _line; do highs+=("$_line");   done < <(scan_hidden "$file" "bidi override chars (text reads differently than shown)" "$HIDDEN_BIDI")
+    while IFS= read -r _line; do highs+=("$_line");   done < <(scan_hidden "$file" "variation selector run (hidden encoded payload)" "$HIDDEN_VS_RUN")
+    while IFS= read -r _line; do highs+=("$_line");   done < <(scan_hidden "$file" "variation selectors (hidden encoded payload)" "$HIDDEN_VS_RARE" 2)
+    while IFS= read -r _line; do mediums+=("$_line"); done < <(scan_tier "$file" "${MEDIUM_PATTERNS[@]}")
+    while IFS= read -r _line; do mediums+=("$_line"); done < <(scan_hidden "$file" "invisible chars (zero-width, soft hyphen, variation selector, mid-file BOM)" "$HIDDEN_ZW")
+    while IFS= read -r _line; do mediums+=("$_line"); done < <(scan_hidden "$file" "Latin word with Cyrillic letters (look-alike spelling)" "$MIXED_SCRIPT")
+    while IFS= read -r _line; do mediums+=("$_line"); done < <(scan_tier_i "$file" "$CSS_HIDDEN")
+    while IFS= read -r _line; do lows+=("$_line");    done < <(scan_tier "$file" "${LOW_PATTERNS[@]}")
+  fi
+  [[ -n "$tmp" ]] && rm -f "$tmp"
+  SCAN_TMP=""
 
   # Determine result
   local status="PASS"
@@ -334,7 +575,7 @@ scan_file() {
     entry=$(jq -n \
       --arg skill "$skill_name" \
       --arg status "$status" \
-      --arg file "$file" \
+      --arg file "$real" \
       --argjson high "$json_highs" \
       --argjson medium "$json_mediums" \
       --argjson low "$json_lows" \
@@ -346,9 +587,9 @@ scan_file() {
     fi
   else
     case "$status" in
-      FAIL) echo -e "${RED}[FAIL]${NC} $skill_name ($file)" ;;
-      WARN) echo -e "${YELLOW}[WARN]${NC} $skill_name ($file)" ;;
-      PASS) echo -e "${GREEN}[PASS]${NC} $skill_name ($file)" ;;
+      FAIL) echo -e "${RED}[FAIL]${NC} $skill_name ($real)" ;;
+      WARN) echo -e "${YELLOW}[WARN]${NC} $skill_name ($real)" ;;
+      PASS) echo -e "${GREEN}[PASS]${NC} $skill_name ($real)" ;;
     esac
 
     # Bash 3.2 (macOS default) treats `"${arr[@]}"` as unbound under `set -u`

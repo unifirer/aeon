@@ -11,12 +11,48 @@ from or pin to; the template keeps serving the latest `main` to new forks.
 
 ### Added
 
+- **Hosted ICP MCP connects in one click, with a read-only `icp-mcp` skill.** DFINITY's hosted ICP MCP
+  (`mcp.internetcomputer.org/mcp`) is now an OAuth server in the dashboard MCP catalog. The operator signs
+  in with Internet Identity once and the session lasts up to 30 days (no refresh token, so the panel says
+  to reconnect when it ends). `icp-mcp` opens an app, reads its canister interfaces and docs, and answers
+  a question with live query calls; it never makes update calls and only reaches apps that published an
+  `ic-architecture` manifest. Disabled by default. Catalog now 93 skills. (#1367)
+
+- **`skill-scan` catches injection phrases in capitals or look-alike letters, and CSS-hidden text.**
+  Injection patterns and the quoted-citation check now match case-insensitively, so `IGNORE ALL PREVIOUS
+  INSTRUCTIONS` fails (HIGH) while a defensive line that cites it still passes. Cyrillic and Greek letters
+  that render like Latin ones are folded to Latin before the patterns run, byte for byte so line numbers
+  hold, and a Latin letter next to a Cyrillic one inside a word warns (MEDIUM). Inline `display:none`,
+  `visibility:hidden`, `font-size:0` and `opacity:0` warn (MEDIUM), and `disregard ... prior` now matches
+  like `disregard ... previous`. Nine new calibration fixtures and a section in
+  `docs/skill-scan-calibration.md` cover each rule; the 92 first-party skills keep their verdicts. (#1363)
+- **PhantomOperator community pack listed.** Its `phantomoperator` skill runs authorized privacy and
+  public-exposure checks and declares Base x402 spend limits; it needs `AEON_X402_WALLET_PRIVATE_KEY` and a
+  person-lookup allowlist and can write on-chain, so read its listing before enabling. (#1283)
+
+- **Verify-run receipts for the dev-loop proof gate.** `scripts/dev-loop-proof.sh` now accepts a
+  verify-run receipt (a clean, read-only Actions run at a pinned PR head) as proof, next to the
+  existing aeon-skill receipt, which parses unchanged. Adds the `epoch-verify` workflow and
+  `scripts/epoch-evidence.sh`; a 26-case matrix rejects push-triggered, wrong-repo, fork-head and
+  moved-head receipts and fails closed when evidence is missing. (#1349)
+- **`skill-scan` flags hidden Unicode.** The scanner now fails on Unicode TAG characters (ASCII
+  smuggling), bidi overrides and isolates (Trojan Source) and runs of variation selectors, and warns on
+  zero-width characters, soft hyphens and a mid-file BOM. The checks run as raw bytes under `LC_ALL=C`,
+  so macOS and Linux agree, allow only the three real subdivision flags and a ZWJ between two emoji,
+  and fail closed when a file cannot be filtered. `bin/add-skill` and `bin/install-skill-pack` gate on
+  it, so a skill with a hidden payload no longer installs without a prompt. Calibration fixtures and
+  `docs/skill-scan-calibration.md` cover each rule. (#1344, #1350, #1351)
+- **Community packs: Bowmark Pack listed, Vauban Pack updated to v0.5.0.** The Bowmark Pack's
+  `bowmark-page-watch` reads the pages you name on a schedule and notifies when one changes (needs
+  `BOWMARK_API_KEY`). The Vauban Pack listing now covers `rule:` dry runs, `inspect:` setting checks and
+  the largest move the caps allow. (#1342, #1345)
+
 - **Telegram private replies, a Details button and a `/panel` run widget (Bot API 10.4).** In
   instant mode the webhook Worker now answers button taps with ephemeral replies only the tapper
   sees, tells a non-owner group member privately that buttons are owner-only, and serves a new
   global **📄 Details** button that shows the skill's full latest output to the tapper alone.
   `/panel` sends an HTML widget with the latest run per skill plus Run and Refresh, answered by the
-  Worker through `widget_query`. The poller falls back to posting Details and a pointer for `/panel`.
+  Worker through `widget_query`. The poller falls back to posting Details and a pointer for `/panel`. (#1348)
 
 - **Internet Computer (ICP) skill pack adds three skills.** `canister-status` alerts on control-plane
   changes (new controller, module-hash upgrade, de-indexing), `sns-digest` posts an NNS and SNS proposal
@@ -304,6 +340,33 @@ from or pin to; the template keeps serving the latest `main` to new forks.
 
 ### Changed
 
+- **`skill-scan` now scans the whole skill folder on install.** `bin/add-skill` and
+  `bin/install-skill-pack` pass the skill directory, so `references/`, templates and helper files are
+  scanned, not just `SKILL.md`. More than 500 text files or any file over 1 MiB fails closed. The `eval` and
+  `rm` glob sinks were tightened so prose and arithmetic no longer trip them. (#1366)
+- **The plugin no longer ships the history-mining script.** Mode 8 (mine history), its script and its
+  reference are removed from both setup-skill copies so the Claude plugin directory accepts the plugin;
+  `plugin/SECURITY.md` now says it is Markdown only. (#1370)
+- **Setup-skill doc examples use `YOUR_API_KEY`** instead of real secret names in header and curl
+  examples. (#1371)
+- **Maintenance.** CI test runs use random order on Node 24 and job time limits are sized to measured run
+  times; the dashboard `syncPush` tests no longer depend on order. (#1372, #1373, #1374)
+- **YUSA Pack homepage moved to `yusasecurity.xyz`.** The community pack listing in
+  `catalog/skill-packs.json` now links the pack's own domain instead of the old preview URL. (#1360)
+- **Maintenance.** `hono` 4.13.18 and `@hono/node-server` 2.1.8 bundled in `apps/mcp-server`
+  (lockfile only; replaces #1356 and #1359). (#1362)
+- **Maintenance.** `next` bumped from 16.4.3 to 16.4.5 in `apps/dashboard`. (#1365)
+- **Token usage and the run manifest record the model that answered.** A gateway can remap the requested
+  model, so `scripts/effective-model.sh` now takes the model from the run envelope (the adapter's `model`
+  field, else the Claude `modelUsage` entry with the most output tokens, else the requested model) and
+  writes `SKILL_MODEL`, `SKILL_MODEL_REQUESTED` and `SKILL_MODEL_SOURCE`. The signed manifest gains
+  `model_requested`, `model_source` and `gateway`; `token-usage.csv` columns are unchanged. A harness
+  that reports no model still records the requested one, with a warning. (#1343)
+- **`aeon-update` gets a `keep_local` list.** Instance-rewritten docs and files deleted on purpose no
+  longer come back as conflicts every sync. An optional `keep_local` glob list in
+  `memory/topics/aeon-update-state.json` marks matching paths `KEEP-LOCAL`: never written, never a
+  conflict, listed under `kept_local`. Conflicts now list workflow and harness-adapter files first. (#1354)
+
 - **Sentinel community pack listing is 10 skills,** adding `pons-pool-check`, which names a Pons token's
   official Uniswap v4 pool on Robinhood Chain and lists the other pools for the same token. (#1336)
 - **ICP integration reference added** under `docs/icp/`: MCP verification, architecture, skills
@@ -502,6 +565,16 @@ from or pin to; the template keeps serving the latest `main` to new forks.
   showcase hooks in `aeonfun/univ4-hooks` carried the fee. (#1035)
 
 ### Fixed
+
+- **Ecosystem page: PancakeSwap X link fixed.** `docs/ECOSYSTEM.md` now points to `@PancakeFi`, the
+  account's new handle; the old `@PancakeSwap` link returned 404. The website reads this file live. (#1368)
+- **`changelog` push-to mode works on the first try.** The skill runs `gh auth setup-git` after the
+  cross-repo clone and opens the PR with explicit `--repo`, `--head` and `--base`, so the push and the PR no
+  longer fail and recover by improvising. (#1354)
+- **`token-movers` gives moves of 3% or more a directional verdict.** RALLYING and SLIDING no longer need a
+  volume ratio of 1.0 or more, QUIET and CONSOLIDATING require a price change under 3%, and thin volume
+  goes in the verdict line instead of softening the label. (#1354)
+- **Ecosystem page: dead Sentysis X link fixed.** It now points to `@Sentysisdotcom`. (#1347)
 
 - **`token-movers` verdicts no longer skip big moves.** RALLYING and SLIDING now also cover a 10%+ day on
   under 2.0x volume, which used to publish as CONSOLIDATING. Single-token mode saves each API response to a

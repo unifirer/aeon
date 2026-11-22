@@ -7,7 +7,7 @@ Three things share the name. Get this wrong and nothing works.
 | | |
 |---|---|
 | **`.mcp.json`** - *external MCP servers, called BY Aeon skills* | Wired via the dashboard MCP panel or `./aeon mcp add`. This is what you want when a skill needs a tool. |
-| **`bin/add-mcp`** - *Aeon itself AS an MCP server* | Builds `apps/mcp-server` and registers it with Claude Code / Desktop, so all 92 skills appear as `aeon-*` tools **in your local Claude**. Nothing to do with a skill calling out. |
+| **`bin/add-mcp`** - *Aeon itself AS an MCP server* | Builds `apps/mcp-server` and registers it with Claude Code / Desktop, so all 93 skills appear as `aeon-*` tools **in your local Claude**. Nothing to do with a skill calling out. |
 | **`www.aeon.fun/connect/mcp`** - *your Aeon as a HOSTED MCP server* | Aeon Connect's remote server: sign in with GitHub, pick your agent repo, then run skills (on your GitHub Actions), read runs, output and memory, and toggle skills **from ChatGPT, Claude or any MCP client**. Nothing to install, no keys in chat. Claude Code: `claude mcp add --transport http aeon https://www.aeon.fun/connect/mcp`. |
 
 The rest of this doc is the first one. For the second: `bin/add-mcp`, `--desktop` for a Claude Desktop snippet, `--uninstall` to remove, `claude mcp list` to verify. For the third: add the URL as a custom connector (ChatGPT, Claude) or with the command above, then sign in when asked.
@@ -18,7 +18,7 @@ The rest of this doc is the first one. For the second: `bin/add-mcp`, `--desktop
 
 `./aeon` → **MCP** panel. Featured servers install one-click. Behaviour depends on the catalog entry:
 
-- **`authSecret`** → wires `Authorization: Bearer ${SECRET}` and shows a paste-token row.
+- **`authSecret`** → wires an `Authorization: Bearer YOUR_API_KEY` header (the real value comes from the repo secret) and shows a paste-token row.
 - **`oauth: true`** → shows **Connect**, runs the browser OAuth flow, stores tokens as repo secrets. See *Key refresh* below.
 - **Neither** → public server, no auth wired.
 
@@ -30,7 +30,7 @@ The rest of this doc is the first one. For the second: `bin/add-mcp`, `--desktop
 ./aeon mcp add glim                        # by catalog slug
 ./aeon mcp add myserver https://x.com/mcp  # custom HTTP
 ./aeon mcp add myserver https://… --sse    # SSE transport
-./aeon mcp add myserver https://… --header "Authorization: Bearer \${MY_TOKEN}"
+./aeon mcp add myserver https://… --header "Authorization: Bearer YOUR_API_KEY"
 ./aeon mcp rm myserver
 ```
 
@@ -65,7 +65,7 @@ Append to `MCP_CATALOG` in `apps/dashboard/lib/mcp-catalog.ts`. That one array f
     "glim": {
       "type": "http",
       "url": "https://glim.sh/mcp",
-      "headers": { "Authorization": "Bearer ${MCP_GLIM_TOKEN}" }
+      "headers": { "Authorization": "Bearer YOUR_API_KEY" }
     }
   }
 }
